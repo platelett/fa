@@ -1,44 +1,77 @@
 # Flash Attention on Ascend
 
-四个版本做的是同一个 attention 计算，输入和输出都是 FP16：
+这个仓库在昇腾 NPU 上比较四种 Flash Attention 实现。它们使用同样的输入、完成同样的计算，输入和输出都是半精度（FP16）。
 
-- **Torch**：直接调用 `torch_npu` 提供的 attention 算子。
-- **TileLang**：用 TileLang 实现，使用三个流水缓存槽（ns3），基于 PR #1852。
-- **CCE FP16**：直接写底层代码，中间的输出累加使用半精度。
-- **CCE FP32**：直接写底层代码，向量计算和中间的输出累加使用单精度。
+- **Torch**：调用 `torch_npu` 提供的现成 attention 算子，作为比较基准。
+- **TileLang**：用 TileLang 编写 attention 内核，可以自己安排计算和数据搬运。
+- **CCE FP16**：用昇腾的底层编程接口手工实现，中间计算和各分块结果的累加主要使用半精度。
+- **CCE FP32**：同样是手工实现，将矩阵乘法之外的计算和中间输出累加主要改为单精度（FP32）。两个 CCE 版本的矩阵乘法仍使用 FP16。
 
-下面是三个输入规模的实测结果。`Batch` 是一次处理的样本数，`Length` 是每个样本的序列长度。
+## 性能怎么看
 
-**用时：单位为毫秒，越小越快。**
+表中每一行是一组输入。`Batch` 表示一次处理几个样本，`Length` 表示每个样本的序列长度。四个版本处理的输入相同，结果都通过了正确性检查。
 
-| Batch | Length | Torch | TileLang ns3 | CCE FP16 | CCE FP32 |
+**用时越小越快，单位为毫秒。**
+
+| Batch | Length | Torch | TileLang | CCE FP16 | CCE FP32 |
 |---:|---:|---:|---:|---:|---:|
 | 2 | 131072 | 1207.513 | 1118.169 | 572.472 | 793.552 |
 | 2 | 65536 | 300.555 | 276.640 | 143.603 | 199.889 |
 | 1 | 32768 | 37.564 | 34.508 | 18.440 | 25.524 |
 
-**达到理论 Cube 峰值的比例：越高，越接近这台机器的矩阵乘法速度上限。**
+**下面的百分比，用来比较实际速度与这台机器的理论矩阵乘法速度。越高，越接近理论上限。**
 
-| Batch | Length | Torch | TileLang ns3 | CCE FP16 | CCE FP32 |
+Cube 是昇腾中负责矩阵乘法的计算单元。我们用 attention 中两次矩阵乘法的计算量，估算它们在 Cube 满速运行时需要多久，再除以完整 attention 的实测用时。
+
+例如，第一组输入的两次矩阵乘法，理想情况下需要约 **557 毫秒**；CCE FP16 完成整个 attention 实际用了约 **572 毫秒**。因此它达到的比例约为 `557 / 572 = 97.3%`。这个比例比较的是计算速度，不是硬件忙碌时间。
+
+| Batch | Length | Torch | TileLang | CCE FP16 | CCE FP32 |
 |---:|---:|---:|---:|---:|---:|
 | 2 | 131072 | 46.1% | 49.8% | 97.3% | 70.2% |
 | 2 | 65536 | 46.3% | 50.4% | 97.0% | 69.7% |
 | 1 | 32768 | 46.4% | 50.5% | 94.4% | 68.2% |
 
-例如，97.3% 表示整个 attention 的速度已接近矩阵乘法的理论上限；它不表示 Cube 有 97.3% 的时间在工作。四个版本都按这台机器的同一个上限计算：**25 个 Cube 的 FP16 峰值，合计 378.88 TFLOPS**。CCE FP32 的矩阵乘法仍使用 FP16，因此也采用这个上限。
+两张表都来自同一台 Atlas A3：预热后各测 10 次，取中位数。四个版本的百分比使用同一个参照——这台机器 25 个 Cube 的 FP16 理论峰值，共 378.88 TFLOPS。
 
-测试使用 Atlas A3、CANN 9.1 和 TileLang PR #1852。每项预热后测 10 次，表中取中位数；三个输入规模都通过了正确性检查。TileLang 使用 24 组，CCE 使用本机已验证的多 block 模式（`FA_LOGICAL_BLOCKS=0`）。代码默认使用 24 组，性能模式需先通过设备检查。
+## 怎么运行
+
+先准备好已有的 PyTorch、`torch_npu`、CANN 和 TileLang 环境；本仓库不安装这些外部依赖。TileLang 使用 [PR #1852](https://github.com/tile-ai/tilelang-ascend/pull/1852)，具体版本见后面的 Environment 部分。
+
+将 `env.local.sh.example` 复制为 `env.local.sh`，填入已有 TileLang 环境脚本的路径，然后在 Bash 中运行：
+
+```bash
+source env.sh
+npu-smi info
+# 选择空闲设备；这里以设备 0 为例。
+python -m core.bench --cases all --devices 0
+```
+
+这会运行四个版本，检查结果，并生成本地计时报告。默认配置使用 24 组计算单元。
+
+**要使用上表的测试配置，在本机已验证的 25-Cube 设备上运行：**
+
+```bash
+FA_LOGICAL_BLOCKS=0 python -m core.bench --cases all --devices 0
+```
+
+这个设置只改变两个 CCE 版本的任务分配，允许许多小任务接续执行。代码会先检查设备是否适用；TileLang 仍使用 24 组。上表使用的就是这个配置，因此默认命令的 CCE 用时可能不同。
+
+以下是供查看代码和调整实现时使用的细节。
 
 <details>
-<summary>峰值比例的计算方法</summary>
+<summary>测试参数与峰值比例公式</summary>
 
-只计 QK 和 PV 两次矩阵乘法的计算量。所有测试均为非因果 attention，12 个 query heads，head dimension 为 128。
+测试环境：Atlas A3 `Ascend910_9392`、CANN 9.1、TileLang PR #1852 提交 `77a444b2`。每轮预热 3 次，按正反顺序各测 5 次，保留全部 10 个样本。输入为非因果 attention，12 个 query heads、1 个 KV head，head dimension 为 128。
+
+仅统计 QK 和 PV 两次矩阵乘法的 FLOPs：
 
 ```text
 QK/PV FLOPs = 4 * B * Hq * Nq * Nk * D
 peak ratio = QK/PV FLOPs / (time_seconds * 378.88e12)
 nominal peak = 25 * 1.85e9 * 8192 FLOP/cycle
 ```
+
+选中的 TileLang 配置使用三个工作区槽（ns3），通过 `reduce_max`、减法、`exp` 和 `reduce_sum` 组合完成在线 softmax，不需要额外的融合 softmax 接口。
 
 </details>
 
@@ -53,7 +86,7 @@ installation scripts are included.
 | Backend | Implementation |
 |---|---|
 | `npu_fa` | `torch_npu.npu_fusion_attention`, native GQA; correctness reference |
-| `tl_stream_v3` | TL v3 with three pipeline stages and composed reduce-max/subtract/exp/reduce-sum softmax |
+| `tl_stream_v3` | TL v3 with three workspace slots (ns3) and composed reduce-max/subtract/exp/reduce-sum softmax |
 | `cce_fa_nqkq_nz_resident_v13_q768_pool_i4_p128` | CCE Normal-NZ Q-K-Q, Q_L1=768, WS_Q=256, WS_K=512; resident FP16 O |
 | `cce_fa_nk_nz_vector_fp32_v3` | CCE Normal-NZ K-first, Q_L1=WS_Q=256, WS_K=512; resident FP32 O; no BAR.V in the Vector payload |
 
