@@ -1,11 +1,6 @@
 # Flash Attention on Ascend
 
-这个仓库在昇腾 NPU 上比较四种 Flash Attention 实现。它们使用同样的输入、完成同样的计算，输入和输出都是半精度（FP16）。
-
-- **Torch**：调用 `torch_npu` 提供的现成 attention 算子，作为比较基准。
-- **TileLang**：用 TileLang 编写 attention 内核，可以自己安排计算和数据搬运。
-- **CCE FP16**：用昇腾的底层编程接口手工实现，中间计算和各分块结果的累加主要使用半精度。
-- **CCE FP32**：同样是手工实现，将矩阵乘法之外的计算和中间输出累加主要改为单精度（FP32）。两个 CCE 版本的矩阵乘法仍使用 FP16。
+本仓库比较四种 attention 实现：**Torch** 调用 NPU 内置算子；**TileLang** 用 TileLang 编写；两个 **CCE** 版本使用底层接口手工实现，分别以 FP16、FP32 进行主要的中间计算。四版输入、输出均为 FP16。
 
 ## 性能怎么看
 
