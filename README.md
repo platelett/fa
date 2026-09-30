@@ -1,23 +1,51 @@
 # Flash Attention on Ascend
 
-本仓库保留四个实现：**Torch** 调用 NPU 内置融合 attention；**TL v3** 使用 #1852 的 `reduce_max/sum` 组合在线 softmax，采用 ns3；**CCE FP16** 使用驻留 FP16 O 的 Normal-NZ Q-K-Q；**CCE FP32** 使用驻留 FP32 O 的 Normal-NZ K-first。输入、输出均为 FP16，FP32 版主要指 Vector 运算与 O 累加精度。
+四个版本做的是同一个 attention 计算，输入和输出都是 FP16：
 
-以下为 Atlas A3 (`Ascend910_9392`)、CANN 9.1、TileLang #1852 `77a444b2` 的设备耗时中位数，单位 ms；每项预热 3 次，正反顺序共 10 个样本。TL 使用 24 组；CCE 使用本机已验证的 25-Cube/50-Vector 多 block 模式（`FA_LOGICAL_BLOCKS=0`）。三个 case 均通过正确性检查。
+- **Torch**：直接调用 `torch_npu` 提供的 attention 算子。
+- **TileLang**：用 TileLang 实现，使用三个流水缓存槽（ns3），基于 PR #1852。
+- **CCE FP16**：直接写底层代码，中间的输出累加使用半精度。
+- **CCE FP32**：直接写底层代码，向量计算和中间的输出累加使用单精度。
 
-| Case (B, S) | Torch ms / peak | TL ns3 ms / peak | CCE FP16 ms / peak | CCE FP32 ms / peak |
-|---|---:|---:|---:|---:|
-| 2, 131072 | 1207.513 / 46.1% | 1118.169 / 49.8% | 572.472 / 97.3% | 793.552 / 70.2% |
-| 2, 65536 | 300.555 / 46.3% | 276.640 / 50.4% | 143.603 / 97.0% | 199.889 / 69.7% |
-| 1, 32768 | 37.564 / 46.4% | 34.508 / 50.5% | 18.440 / 94.4% | 25.524 / 68.2% |
+下面是三个输入规模的实测结果。`Batch` 是一次处理的样本数，`Length` 是每个样本的序列长度。
 
-`peak` 为 QK/PV 等效 FLOPS 占本机 **25 Cube FP16 名义峰值 378.88 TFLOPS** 的比例，四个版本使用同一分母：`4 * B * Hq * Nq * Nk * D / (time_seconds * 378.88e12)`。名义峰值按 `25 * 1.85 GHz * 8192 FLOP/cycle` 计算。它不是 profiler 的 Cube 忙碌比例；CCE FP32 的 Cube 仍使用 FP16 MAD，因此同样按 FP16 峰值计。
+**用时：单位为毫秒，越小越快。**
 
-公开默认仍为 24 组；上述 CCE 性能模式仅适用于已通过本机拓扑验证的设备。
+| Batch | Length | Torch | TileLang ns3 | CCE FP16 | CCE FP32 |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 131072 | 1207.513 | 1118.169 | 572.472 | 793.552 |
+| 2 | 65536 | 300.555 | 276.640 | 143.603 | 199.889 |
+| 1 | 32768 | 37.564 | 34.508 | 18.440 | 25.524 |
+
+**达到理论 Cube 峰值的比例：越高，越接近这台机器的矩阵乘法速度上限。**
+
+| Batch | Length | Torch | TileLang ns3 | CCE FP16 | CCE FP32 |
+|---:|---:|---:|---:|---:|---:|
+| 2 | 131072 | 46.1% | 49.8% | 97.3% | 70.2% |
+| 2 | 65536 | 46.3% | 50.4% | 97.0% | 69.7% |
+| 1 | 32768 | 46.4% | 50.5% | 94.4% | 68.2% |
+
+例如，97.3% 表示整个 attention 的速度已接近矩阵乘法的理论上限；它不表示 Cube 有 97.3% 的时间在工作。四个版本都按这台机器的同一个上限计算：**25 个 Cube 的 FP16 峰值，合计 378.88 TFLOPS**。CCE FP32 的矩阵乘法仍使用 FP16，因此也采用这个上限。
+
+测试使用 Atlas A3、CANN 9.1 和 TileLang PR #1852。每项预热后测 10 次，表中取中位数；三个输入规模都通过了正确性检查。TileLang 使用 24 组，CCE 使用本机已验证的多 block 模式（`FA_LOGICAL_BLOCKS=0`）。代码默认使用 24 组，性能模式需先通过设备检查。
+
+<details>
+<summary>峰值比例的计算方法</summary>
+
+只计 QK 和 PV 两次矩阵乘法的计算量。所有测试均为非因果 attention，12 个 query heads，head dimension 为 128。
+
+```text
+QK/PV FLOPs = 4 * B * Hq * Nq * Nk * D
+peak ratio = QK/PV FLOPs / (time_seconds * 378.88e12)
+nominal peak = 25 * 1.85e9 * 8192 FLOP/cycle
+```
+
+</details>
 
 A small benchmark framework for non-causal, FP16-input grouped-query attention
 on Ascend A3 (`ascend910_93`), with head dimension 128. It contains four selected
 implementations, their source code, and a common correctness/timing runner.
-No benchmark results, compiled binaries, external dependencies, or dependency
+No raw benchmark output files, compiled binaries, external dependencies, or dependency
 installation scripts are included.
 
 ## Implementations
