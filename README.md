@@ -1,5 +1,17 @@
 # Flash Attention on Ascend
 
+本仓库保留四个实现：**Torch** 调用 NPU 内置融合 attention；**TL v3** 使用 #1852 的 `reduce_max/sum` 组合在线 softmax，采用 ns3；**CCE FP16** 使用驻留 FP16 O 的 Normal-NZ Q-K-Q；**CCE FP32** 使用驻留 FP32 O 的 Normal-NZ K-first。输入、输出均为 FP16，FP32 版主要指 Vector 运算与 O 累加精度。
+
+以下为 Atlas A3 (`Ascend910_9392`)、CANN 9.1、TileLang #1852 `77a444b2` 的设备耗时中位数，单位 ms；每项预热 3 次，正反顺序共 10 个样本。TL 使用 24 组；CCE 使用本机已验证的 25-Cube/50-Vector 多 block 模式（`FA_LOGICAL_BLOCKS=0`）。三个 case 均通过正确性检查。
+
+| Case (B, S) | Torch ms | TL ns3 ms | CCE FP16 ms | CCE FP32 ms |
+|---|---:|---:|---:|---:|
+| 2, 131072 | 1207.513 | 1118.169 | 572.472 | 793.552 |
+| 2, 65536 | 300.555 | 276.640 | 143.603 | 199.889 |
+| 1, 32768 | 37.564 | 34.508 | 18.440 | 25.524 |
+
+公开默认仍为 24 组；上述 CCE 性能模式仅适用于已通过本机拓扑验证的设备。
+
 A small benchmark framework for non-causal, FP16-input grouped-query attention
 on Ascend A3 (`ascend910_93`), with head dimension 128. It contains four selected
 implementations, their source code, and a common correctness/timing runner.
@@ -11,7 +23,7 @@ installation scripts are included.
 | Backend | Implementation |
 |---|---|
 | `npu_fa` | `torch_npu.npu_fusion_attention`, native GQA; correctness reference |
-| `tl_stream_v3` | TL v3 with two pipeline stages and composed reduce-max/subtract/exp/reduce-sum softmax |
+| `tl_stream_v3` | TL v3 with three pipeline stages and composed reduce-max/subtract/exp/reduce-sum softmax |
 | `cce_fa_nqkq_nz_resident_v13_q768_pool_i4_p128` | CCE Normal-NZ Q-K-Q, Q_L1=768, WS_Q=256, WS_K=512; resident FP16 O |
 | `cce_fa_nk_nz_vector_fp32_v3` | CCE Normal-NZ K-first, Q_L1=WS_Q=256, WS_K=512; resident FP32 O; no BAR.V in the Vector payload |
 

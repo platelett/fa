@@ -9,7 +9,7 @@ META = Meta(
     is_reference=False,
     author="platelet",
     date="2026-09-08",
-    notes="Online reduce-max/subtract/exp/reduce-sum softmax; explicit synchronization; no fused softmax extension.",
+    notes="Three-stage online reduce-max/subtract/exp/reduce-sum softmax; explicit synchronization; no fused softmax extension.",
 )
 
 
