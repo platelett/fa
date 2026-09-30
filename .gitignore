@@ -1,0 +1,19 @@
+# Local configuration and credentials
+env.local.sh
+.env
+.env.*
+# Generated files and caches
+__pycache__/
+*.py[cod]
+*.egg-info/
+.build/
+*.so
+*.o
+*.a
+*.log
+.pkl_memoize_py3/
+# Local benchmark/profiler outputs
+results/
+PROF_*/
+.fa_ascendc.lock
+panel_generation.json

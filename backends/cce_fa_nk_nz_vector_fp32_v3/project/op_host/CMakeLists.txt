@@ -1,0 +1,7 @@
+set(host_src ${CMAKE_CURRENT_SOURCE_DIR}/fa_fa_nk_nz_vector_fp32_v3.cpp)
+npu_op_code_gen(SRC ${host_src} PACKAGE ${package_name} OUT_DIR ${ASCEND_AUTOGEN_PATH})
+npu_op_library(cust_optiling TILING ${host_src})
+file(GLOB aclnn_src ${ASCEND_AUTOGEN_PATH}/aclnn_*.cpp)
+set_source_files_properties(${aclnn_src} PROPERTIES GENERATED TRUE)
+npu_op_library(cust_opapi ACLNN ${aclnn_src})
+npu_op_package_add(${package_name} LIBRARY cust_optiling cust_opapi)

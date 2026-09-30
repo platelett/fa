@@ -1,0 +1,4 @@
+MODE='nk'
+WS_Q=0
+TRANSPOSE=False
+SP_NZ=True

@@ -1,0 +1,4 @@
+MODE='nqkq'
+WS_Q=256
+TRANSPOSE=False
+SP_NZ=True
