@@ -2,6 +2,8 @@
 
 本仓库比较四种 attention 实现：**Torch** 调用 NPU 内置算子；**TileLang** 用 TileLang 编写；两个 **CCE** 版本使用底层接口手工实现，分别以 FP16、FP32 进行主要的中间计算。四版输入、输出均为 FP16。
 
+想了解这些实现怎样一步步变快，可以阅读[中文优化历程](docs/optimization/README.md)：分别介绍 TileLang、CCE FP16 和 CCE FP32，也整理了没有采用的尝试。
+
 ## 性能怎么看
 
 表中每一行是一组输入。`Batch` 表示一次处理几个样本，`Length` 表示每个样本的序列长度。四个版本处理的输入相同，结果都通过了正确性检查。
