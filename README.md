@@ -11,7 +11,7 @@ installation scripts are included.
 | Backend | Implementation |
 |---|---|
 | `npu_fa` | `torch_npu.npu_fusion_attention`, native GQA; correctness reference |
-| `tl_stream_v3` | TL v3 with three pipeline stages and fused `T.softmax_flash_v2` |
+| `tl_stream_v3` | TL v3 with two pipeline stages and composed reduce-max/subtract/exp/reduce-sum softmax |
 | `cce_fa_nqkq_nz_resident_v13_q768_pool_i4_p128` | CCE Normal-NZ Q-K-Q, Q_L1=768, WS_Q=256, WS_K=512; resident FP16 O |
 | `cce_fa_nk_nz_vector_fp32_v3` | CCE Normal-NZ K-first, Q_L1=WS_Q=256, WS_K=512; resident FP32 O; no BAR.V in the Vector payload |
 
@@ -20,9 +20,10 @@ The CCE FP32 variant uses FP32 Vector arithmetic except FP16 max comparisons;
 Cube communication (S, P and partial O) remains FP16. The FP16 variant can
 overflow for sufficiently large unnormalized accumulators.
 
-The TL entry preserves the historical three-stage fused-softmax configuration,
-not the later composed-reduction rewrite. It requires the external TileLang
-interface listed below. The CCE projects are self-contained operator sources;
+The TL entry implements online softmax with TileLang-Ascend reduction,
+broadcast, subtraction and exponential primitives. Running maximum, denominator
+updates and delayed O accumulation are included. It needs no added fused-softmax
+operator or compiler patch. The CCE projects are self-contained operator sources;
 they do not import generators or other backends from the research repository.
 
 ## Environment
@@ -32,12 +33,15 @@ CANN/BiSheng, CMake, and (for the TL entry only) compatible TileLang-Ascend.
 The CCE sources target the CANN 9.1 / dav-c220 API. Dependencies are not managed
 by this repository.
 
-The selected historical TL implementation requires `T.softmax_flash_v2`,
-Expert-mode allocation/layout APIs, manual synchronization, and the row-expand
-operations used in `backends/tl_stream_v3/impl_tl.py`. Some newer TileLang-Ascend
-versions remove `T.softmax_flash_v2`; those versions cannot compile this entry.
-Activate a compatible external checkout. The other three backends can run
-independently without TileLang.
+Use the TileLang-Ascend implementation from
+[PR #1852](https://github.com/tile-ai/tilelang-ascend/pull/1852), revision
+`77a444b2b7e5b721e976d2918a3923155d80ca3f`, which provides the refactored
+FP32 `T.reduce_max` / `T.reduce_sum` implementation. The TL entry uses its
+existing Expert layout/allocation, synchronization and BRCB/row-expand APIs.
+No extra fused-softmax interface or local compiler patch is required.
+Activate that external TileLang environment yourself; it is not vendored or
+installed by this repository. The other three backends run independently
+without TileLang.
 
 Using Bash, copy `env.local.sh.example` to the ignored `env.local.sh` and point
 it at your existing TileLang activation script when needed. Then:

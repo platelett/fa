@@ -1,4 +1,4 @@
-"""TL v3 three-stage SoftmaxFlashV2 configuration."""
+"""tl_stream_v3 -- composed online softmax using reduction primitives, fully manual sync."""
 
 from core.contract import Meta
 
@@ -9,17 +9,11 @@ META = Meta(
     is_reference=False,
     author="platelet",
     date="2026-09-08",
-    notes="Three-stage v3 with fused SoftmaxFlashV2; requires the matching TileLang-Ascend API.",
+    notes="Online reduce-max/subtract/exp/reduce-sum softmax; explicit synchronization; no fused softmax extension.",
 )
 
 
 def kernel(case, *, kernel_name: str):
-    from tilelang import language as T
-    if not hasattr(T, "softmax_flash_v2"):
-        raise RuntimeError(
-            "This TL v3 requires a TileLang-Ascend build exposing T.softmax_flash_v2. "
-            "Activate the compatible external environment before running this backend."
-        )
     from backends.tl_stream_v3 import impl
 
     return impl.flash_attention_fwd(
