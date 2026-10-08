@@ -1,6 +1,10 @@
-"""TL v3: three-stage composed online softmax on PR #1852."""
+"""Expert Flash Attention v2 with three-stage composed online softmax.
+
+See ``README.md`` for the optimization journey.
+"""
 
 import os
+import torch
 
 import tilelang
 from tilelang import language as T
@@ -14,45 +18,37 @@ if os.environ.get("FA_DISABLE_CACHE", "0") == "1":
 # ===========================================================================
 
 # Cube scope
-LOCK A_L1   0 MTE2 MTE1 2
-LOCK KV_L1  2 MTE2 MTE1
-LOCK L0AB   3 MTE1 M     2
-LOCK L0C    5 M    FIX   2
 
 # Vector scope: shared load/store buffers across softmax and O_acc
-LOCK LD_BUF 0 MTE2 V
-LOCK ST_BUF 1 V    MTE3
-LOCK ST_ON  2 V    MTE3
-LOCK OA_WB  3 MTE2 MTE3
 
 # ===========================================================================
 # Constants
 # ===========================================================================
-NUM_CORES = 24          # 910B AI Cores
+NUM_CORES = 24  # 910B AI Cores
 ROW_EXPAND_VECTOR_ELEMS = 64
-DIM = 128               # head dimension (fixed)
+DIM = 128  # head dimension (fixed)
 
-TILE_Q_L2 = 256         # query tile cached in L2
-TILE_KV_L1 = 1024       # key/value tile staged in L1
-TILE_KV_L2 = 1024       # key/value tile at L2 granularity
+TILE_Q_L2 = 256  # query tile cached in L2
+TILE_KV_L1 = 1024  # key/value tile staged in L1
+TILE_KV_L2 = 1024  # key/value tile at L2 granularity
 
-TILE_M = 128            # L0 tile on M (query) axis
-TILE_K = 128            # L0 tile on contraction / output-split axis
+TILE_M = 128  # L0 tile on M (query) axis
+TILE_K = 128  # L0 tile on contraction / output-split axis
 
-TILE_Q_UB = 8           # narrow strip for softmax (transcendentals)
-TILE_Q_ACC = 64         # wide strip for O_acc update (MACs)
+TILE_Q_UB = 8  # narrow strip for softmax (transcendentals)
+TILE_Q_ACC = 64  # wide strip for O_acc update (MACs)
 
-NUM_STAGES = 3          # pipeline depth / token-ring size
-NUM_L1_CHUNKS = TILE_KV_L2 // TILE_KV_L1   # currently 1
+NUM_STAGES = 3  # pipeline depth / token-ring size
+NUM_L1_CHUNKS = TILE_KV_L2 // TILE_KV_L1  # currently 1
 
 # L0 iteration counts (derived, used in GEMM macros)
-M_ITERS = TILE_Q_L2 // TILE_M    # 2  — m-tiles per GEMM invocation
-N_ITERS = TILE_KV_L1 // TILE_K   # 8  — output-split tiles (GEMM1)
-K_ITERS = TILE_KV_L1 // TILE_K   # 8  — contraction tiles  (GEMM2)
+M_ITERS = TILE_Q_L2 // TILE_M  # 2  — m-tiles per GEMM invocation
+N_ITERS = TILE_KV_L1 // TILE_K  # 8  — output-split tiles (GEMM1)
+K_ITERS = TILE_KV_L1 // TILE_K  # 8  — contraction tiles  (GEMM2)
 
 # Cross-core semaphore IDs
-SEM_CUBE = 0    # Vector → Cube: "P ready" / "slot free"
-SEM_VEC  = 1    # Cube → Vector: "S ready" / "O ready"
+SEM_CUBE = 0  # Vector → Cube: "P ready" / "slot free"
+SEM_VEC = 1  # Cube → Vector: "S ready" / "O ready"
 
 # composed softmax block alignment: float32 → 8 elements per 32-byte block
 ELEM_PER_BLK = 8
@@ -71,83 +67,124 @@ pass_configs = {
 # Layer 2: Building-block macros
 # ===========================================================================
 
+
 # ---------------------------------------------------------------------------
 # gemm_output_split: Q[TILE_Q_L2, DIM] @ K[TILE_KV_L1, DIM]^T → S[TILE_Q_L2, TILE_KV_L1]
 # ---------------------------------------------------------------------------
 @T.macro(hygienic=False)
 def gemm_output_split(
-    a_src, a_i0, a_offset,
-    b_src, b_i0, b_offset,
-    out, out_i0, out_i1,
-    a_l1, kv_l1, l0a, l0b, l0c,
+    a_src,
+    a_i0,
+    a_offset,
+    b_src,
+    b_i0,
+    b_offset,
+    out,
+    out_i0,
+    out_i1,
+    a_l1,
+    kv_l1,
+    l0a,
+    l0b,
+    l0c,
 ):
     # Phase 1: bulk-load all K tiles to L1
-    ACQ MTE2 KV_L1
+    T.wait_flag("MTE1", "MTE2", 2)
     for ni in T.serial(N_ITERS):
         T.copy(b_src[b_i0, b_offset + ni * TILE_K : b_offset + (ni + 1) * TILE_K, :], kv_l1[ni, :, :])
-    REL MTE2 KV_L1
+    T.set_flag("MTE2", "MTE1", 2)
 
     # Phase 2: tiled MMA (Q loaded per m-tile, a_l1 double-buffered on mi)
-    ACQ MTE1 KV_L1
+    T.wait_flag("MTE2", "MTE1", 2)
     for mi in T.serial(M_ITERS):
         mi_side = mi % 2
-        LOCKED MTE2 A_L1(mi_side): T.copy(a_src[a_i0, a_offset + mi * TILE_M : a_offset + (mi + 1) * TILE_M, :], a_l1[mi_side, :, :])
+        T.wait_flag("MTE1", "MTE2", 0 + mi_side)
+        T.copy(a_src[a_i0, a_offset + mi * TILE_M : a_offset + (mi + 1) * TILE_M, :], a_l1[mi_side, :, :])
+        T.set_flag("MTE2", "MTE1", 0 + mi_side)
 
-        ACQ MTE1 A_L1(mi_side)
+        T.wait_flag("MTE2", "MTE1", 0 + mi_side)
         for ni in T.serial(N_ITERS):
             side = ni % 2
-            ACQ MTE1 L0AB(side)
+            T.wait_flag("M", "MTE1", 3 + side)
             if ni < 2:
                 T.copy(a_l1[mi_side, :, :], l0a[side, :, :])
             T.copy(kv_l1[ni, :, :], l0b[side, :, :], transpose=True)
-            REL MTE1 L0AB(side)
+            T.set_flag("MTE1", "M", 3 + side)
 
-            LOCKED M L0AB(side), L0C(side): T.mma(l0a[side, :, :], l0b[side, :, :], l0c[side, :, :], init=True)
-            LOCKED FIX L0C(side): T.copy(l0c[side, :, :], out[out_i0, out_i1, mi * TILE_M : (mi + 1) * TILE_M, ni * TILE_K : (ni + 1) * TILE_K])
-        REL MTE1 A_L1(mi_side)
-    REL MTE1 KV_L1
+            T.wait_flag("MTE1", "M", 3 + side)
+            T.wait_flag("FIX", "M", 5 + side)
+            T.mma(l0a[side, :, :], l0b[side, :, :], l0c[side, :, :], init=True)
+            T.set_flag("M", "MTE1", 3 + side)
+            T.set_flag("M", "FIX", 5 + side)
+            T.wait_flag("M", "FIX", 5 + side)
+            T.copy(l0c[side, :, :], out[out_i0, out_i1, mi * TILE_M : (mi + 1) * TILE_M, ni * TILE_K : (ni + 1) * TILE_K])
+            T.set_flag("FIX", "M", 5 + side)
+        T.set_flag("MTE1", "MTE2", 0 + mi_side)
+    T.set_flag("MTE1", "MTE2", 2)
+
 
 # ---------------------------------------------------------------------------
 # gemm_contraction_split: P[TILE_Q_L2, TILE_KV_L1] @ V[TILE_KV_L1, DIM] → O[TILE_Q_L2, DIM]
 # ---------------------------------------------------------------------------
 @T.macro(hygienic=False)
 def gemm_contraction_split(
-    a_src, a_i0, a_i1,
-    b_src, b_i0, b_offset,
-    out, out_i0, out_i1,
-    a_l1, kv_l1, l0a, l0b, l0c,
+    a_src,
+    a_i0,
+    a_i1,
+    b_src,
+    b_i0,
+    b_offset,
+    out,
+    out_i0,
+    out_i1,
+    a_l1,
+    kv_l1,
+    l0a,
+    l0b,
+    l0c,
 ):
     # Phase 1: load all V tiles to L1
-    ACQ MTE2 KV_L1
+    T.wait_flag("MTE1", "MTE2", 2)
     for ki in T.serial(K_ITERS):
         T.copy(b_src[b_i0, b_offset + ki * TILE_K : b_offset + (ki + 1) * TILE_K, :], kv_l1[ki, :, :])
-    REL MTE2 KV_L1
+    T.set_flag("MTE2", "MTE1", 2)
 
     # Phase 2: contraction-split tiled MMA (a_l1 double-buffered on ki)
-    ACQ MTE1 KV_L1
+    T.wait_flag("MTE2", "MTE1", 2)
     for mi in T.serial(M_ITERS):
         c_side = mi % 2
-        ACQ M L0C(c_side)
+        T.wait_flag("FIX", "M", 5 + c_side)
         for ki in T.serial(K_ITERS):
             side = ki % 2
-            LOCKED MTE2 A_L1(side): T.copy(a_src[a_i0, a_i1, mi * TILE_M : (mi + 1) * TILE_M, ki * TILE_K : (ki + 1) * TILE_K], a_l1[side, :, :])
+            T.wait_flag("MTE1", "MTE2", 0 + side)
+            T.copy(a_src[a_i0, a_i1, mi * TILE_M : (mi + 1) * TILE_M, ki * TILE_K : (ki + 1) * TILE_K], a_l1[side, :, :])
+            T.set_flag("MTE2", "MTE1", 0 + side)
 
-            ACQ MTE1 L0AB(side)
-            LOCKED MTE1 A_L1(side): T.copy(a_l1[side, :, :], l0a[side, :, :])
+            T.wait_flag("M", "MTE1", 3 + side)
+            T.wait_flag("MTE2", "MTE1", 0 + side)
+            T.copy(a_l1[side, :, :], l0a[side, :, :])
+            T.set_flag("MTE1", "MTE2", 0 + side)
             T.copy(kv_l1[ki, :, :], l0b[side, :, :])
-            REL MTE1 L0AB(side)
+            T.set_flag("MTE1", "M", 3 + side)
 
-            LOCKED M L0AB(side): T.mma(l0a[side, :, :], l0b[side, :, :], l0c[c_side, :, :], init=(ki == 0))
-        REL M L0C(c_side)
-        LOCKED FIX L0C(c_side): T.copy(l0c[c_side, :, :], out[out_i0, out_i1, mi * TILE_M : (mi + 1) * TILE_M, :])
-    REL MTE1 KV_L1
+            T.wait_flag("MTE1", "M", 3 + side)
+            T.mma(l0a[side, :, :], l0b[side, :, :], l0c[c_side, :, :], init=(ki == 0))
+            T.set_flag("M", "MTE1", 3 + side)
+        T.set_flag("M", "FIX", 5 + c_side)
+        T.wait_flag("M", "FIX", 5 + c_side)
+        T.copy(l0c[c_side, :, :], out[out_i0, out_i1, mi * TILE_M : (mi + 1) * TILE_M, :])
+        T.set_flag("FIX", "M", 5 + c_side)
+    T.set_flag("MTE1", "MTE2", 2)
+
+
 # ===========================================================================
 # Layer 3: Task macros (Vector scope)
 # ===========================================================================
 
 HALF_Q = TILE_Q_L2 // 2
-SOFTMAX_STRIPS = HALF_Q // TILE_Q_UB       # 16
-O_ACC_STRIPS   = HALF_Q // TILE_Q_ACC      # 2
+SOFTMAX_STRIPS = HALF_Q // TILE_Q_UB  # 16
+O_ACC_STRIPS = HALF_Q // TILE_Q_ACC  # 2
+
 
 # ---------------------------------------------------------------------------
 # vec_softmax: TASK 2 — S → P + stats + early release
@@ -158,19 +195,24 @@ O_ACC_STRIPS   = HALF_Q // TILE_Q_ACC      # 2
 # Phase 2B: scale_ring for O_acc rescaling — no DMA
 # ---------------------------------------------------------------------------
 @T.macro(hygienic=False)
-def softmax_composed_update(r):
+def softmax_composed_update(r, score_local, m_stats, l_panel, sfm_brcb, sfm_tmp):
     # Scaled scores -> reduce -> BRCB -> independent Sub batch -> Exp -> sum.
     # Explicit boundaries also protect reuse of the shared reduction arena.
     T.pipe_barrier("v")
     T.reduce_max(
         score_local,
         m_stats[r * TILE_Q_UB : (r + 1) * TILE_Q_UB, :],
-        dim=-1, clear=False, tmp=sfm_tmp,
+        dim=-1,
+        clear=False,
+        tmp=sfm_tmp,
     )
     T.pipe_barrier("v")
     T.tile.brcb_experiment(
-        sfm_brcb, m_stats[r * TILE_Q_UB : (r + 1) * TILE_Q_UB, :],
-        TILE_Q_UB // 8, 1, 8,
+        sfm_brcb,
+        m_stats[r * TILE_Q_UB : (r + 1) * TILE_Q_UB, :],
+        TILE_Q_UB // 8,
+        1,
+        8,
     )
     T.pipe_barrier("v")
     for sub_chunk in T.unroll(TILE_KV_L2 // ROW_EXPAND_VECTOR_ELEMS):
@@ -186,22 +228,23 @@ def softmax_composed_update(r):
     T.reduce_sum(
         score_local,
         l_panel[r * TILE_Q_UB : (r + 1) * TILE_Q_UB, :],
-        dim=-1, tmp=sfm_tmp,
+        dim=-1,
+        tmp=sfm_tmp,
     )
     # Probability casting only reads score_local too. The next strip's entry
     # barrier protects score/scratch reuse; Phase 2B orders the l_panel consumer.
 
 
 @T.macro(hygienic=False)
-def finish_softmax_stats(stage, q_ring):
+def finish_softmax_stats(stage, q_ring, scale_ring, m_prev, sum_brcb, l_panel, l_stats_ring):
     T.tile.brcb_experiment(scale_ring[stage, :, :], m_prev, HALF_Q // 8, 1, 8)
     T.tile.brcb_experiment(sum_brcb, l_panel, HALF_Q // 8, 1, 8)
     T.pipe_barrier("v")
-    T.tile.mul(l_stats_ring[q_ring, :, :], l_stats_ring[q_ring, :, :],
-               scale_ring[stage, :, :])
+    T.tile.mul(l_stats_ring[q_ring, :, :], l_stats_ring[q_ring, :, :], scale_ring[stage, :, :])
     T.pipe_barrier("v")
     T.tile.add(l_stats_ring[q_ring, :, :], l_stats_ring[q_ring, :, :], sum_brcb)
     T.pipe_barrier("v")
+
 
 # ---------------------------------------------------------------------------
 # vec_softmax: TASK 2 — S → P + stats + early release
@@ -212,7 +255,27 @@ def finish_softmax_stats(stage, q_ring):
 # Phase 2B: scale banks for O_acc rescaling — no DMA
 # ---------------------------------------------------------------------------
 @T.macro(hygienic=False)
-def vec_softmax(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages, sm_scale):
+def vec_softmax(
+    step,
+    my_start,
+    num_kv_blocks,
+    num_q_stages,
+    sm_scale,
+    cid,
+    vid,
+    ws_sp,
+    ld_score,
+    score_local,
+    st_prob,
+    m_stats,
+    m_prev,
+    l_panel,
+    sfm_brcb,
+    sum_brcb,
+    l_stats_ring,
+    scale_ring,
+    sfm_tmp,
+):
     stage = step % NUM_STAGES
     q_task = step // num_kv_blocks
     global_q = my_start + q_task
@@ -220,7 +283,7 @@ def vec_softmax(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages, sm_sc
     q_ring = global_q % num_q_stages
 
     if kv_idx == 0:
-        T.tile.fill(m_stats, -(2 ** 30))
+        T.tile.fill(m_stats, -(2**30))
         T.tile.fill(l_stats_ring[q_ring, :, :], 0.0)
         T.pipe_barrier("v")
 
@@ -232,24 +295,30 @@ def vec_softmax(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages, sm_sc
         row = vid * HALF_Q + r * TILE_Q_UB
 
         # MTE2: load S strip from workspace
-        LOCKED MTE2 LD_BUF: T.copy(ws_sp[cid, stage, row : row + TILE_Q_UB, :], ld_score)
+        T.wait_flag("V", "MTE2", 0)
+        T.copy(ws_sp[cid, stage, row : row + TILE_Q_UB, :], ld_score)
+        T.set_flag("MTE2", "V", 0)
 
         # V: fp16 → fp32
-        ACQ V LD_BUF
+        T.wait_flag("MTE2", "V", 0)
         # Previous strip's probability cast reads score_local; next cast overwrites it.
         T.pipe_barrier("v")
         T.copy(ld_score, score_local)
-        REL V LD_BUF
+        T.set_flag("V", "MTE2", 0)
         T.pipe_barrier("v")
 
         # Pre-scale scores for online softmax
         T.tile.mul(score_local, score_local, sm_scale)
 
-        softmax_composed_update(r)
+        softmax_composed_update(r, score_local, m_stats, l_panel, sfm_brcb, sfm_tmp)
 
         # V → MTE3: store P strip
-        LOCKED V ST_BUF: T.copy(score_local, st_prob)
-        LOCKED MTE3 ST_BUF: T.copy(st_prob, ws_sp[cid, stage, row : row + TILE_Q_UB, :])
+        T.wait_flag("MTE3", "V", 1)
+        T.copy(score_local, st_prob)
+        T.set_flag("V", "MTE3", 1)
+        T.wait_flag("V", "MTE3", 1)
+        T.copy(st_prob, ws_sp[cid, stage, row : row + TILE_Q_UB, :])
+        T.set_flag("MTE3", "V", 1)
 
     # --- Early release: P is complete, let Cube start P@V ---
     T.set_cross_flag("MTE3", SEM_CUBE)
@@ -259,11 +328,29 @@ def vec_softmax(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages, sm_sc
     T.pipe_barrier("v")
     T.tile.exp(m_prev, m_prev)
     T.pipe_barrier("v")
-    finish_softmax_stats(stage, q_ring)
+    finish_softmax_stats(stage, q_ring, scale_ring, m_prev, sum_brcb, l_panel, l_stats_ring)
 
 
 @T.macro(hygienic=False)
-def vec_o_acc(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages):
+def vec_o_acc(
+    step,
+    my_start,
+    num_q_blocks,
+    num_kv_blocks,
+    num_q_stages,
+    cid,
+    vid,
+    ws_op,
+    ws_oa,
+    O_bh,
+    ld_o_partial,
+    ld_o_acc,
+    st_o_acc,
+    st_o_norm,
+    row_expand_scalars,
+    scale_ring,
+    l_stats_ring,
+):
     old_step = step - NUM_STAGES
     stage = step % NUM_STAGES
     old_q_task = old_step // num_kv_blocks
@@ -277,18 +364,22 @@ def vec_o_acc(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages):
         row = vid * HALF_Q + r * TILE_Q_ACC
 
         if kv_idx == 0:
-            LOCKED MTE2 LD_BUF: T.copy(ws_op[cid, stage, row : row + TILE_Q_ACC, :], ld_o_partial)
+            T.wait_flag("V", "MTE2", 0)
+            T.copy(ws_op[cid, stage, row : row + TILE_Q_ACC, :], ld_o_partial)
+            T.set_flag("MTE2", "V", 0)
 
-            ACQ V ST_BUF
-            LOCKED V LD_BUF: T.copy(ld_o_partial, st_o_acc)
+            T.wait_flag("MTE3", "V", 1)
+            T.wait_flag("MTE2", "V", 0)
+            T.copy(ld_o_partial, st_o_acc)
+            T.set_flag("V", "MTE2", 0)
         else:
-            ACQ MTE2 LD_BUF
+            T.wait_flag("V", "MTE2", 0)
             T.copy(ws_oa[cid, row : row + TILE_Q_ACC, :], ld_o_acc)
             T.copy(ws_op[cid, stage, row : row + TILE_Q_ACC, :], ld_o_partial)
-            REL MTE2 LD_BUF
+            T.set_flag("MTE2", "V", 0)
 
-            ACQ V LD_BUF
-            ACQ V ST_BUF
+            T.wait_flag("MTE2", "V", 0)
+            T.wait_flag("MTE3", "V", 1)
             T.copy(
                 scale_ring[stage, r * TILE_Q_ACC : (r + 1) * TILE_Q_ACC, :],
                 row_expand_scalars,
@@ -303,7 +394,7 @@ def vec_o_acc(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages):
                 )
             T.pipe_barrier("v")  # Row-wise rescaling -> partial-O addition.
             T.tile.add(st_o_acc, st_o_acc, ld_o_partial)
-            REL V LD_BUF
+            T.set_flag("V", "MTE2", 0)
 
         if kv_idx == num_kv_blocks - 1:
             T.copy(
@@ -322,21 +413,27 @@ def vec_o_acc(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages):
             T.pipe_barrier("v")  # Normalization -> fp16 cast.
 
             q_row = local_q * TILE_Q_L2 + row
-            LOCKED V ST_ON: T.copy(st_o_acc, st_o_norm)
-            LOCKED MTE3 ST_ON: T.copy(st_o_norm, O_bh[bh, q_row : q_row + TILE_Q_ACC, :])
+            T.wait_flag("MTE3", "V", 2)
+            T.copy(st_o_acc, st_o_norm)
+            T.set_flag("V", "MTE3", 2)
+            T.wait_flag("V", "MTE3", 2)
+            T.copy(st_o_norm, O_bh[bh, q_row : q_row + TILE_Q_ACC, :])
+            T.set_flag("MTE3", "V", 2)
 
-        REL V ST_BUF
-        ACQ MTE3 ST_BUF
+        T.set_flag("V", "MTE3", 1)
+        T.wait_flag("V", "MTE3", 1)
         if kv_idx != num_kv_blocks - 1:
             T.copy(st_o_acc, ws_oa[cid, row : row + TILE_Q_ACC, :])
-        REL MTE3 ST_BUF
+        T.set_flag("MTE3", "V", 1)
+
+
 # ===========================================================================
+
 
 # ===========================================================================
 # Main kernel
 # ===========================================================================
-@tilelang.jit(out_idx=[3], workspace_idx=[4, 5, 6], pass_configs=pass_configs,
-              compile_flags=["--cce-auto-sync=off", "-O3"])
+@tilelang.jit(out_idx=[3], workspace_idx=[4, 5, 6], pass_configs=pass_configs, compile_flags=["--cce-auto-sync=off", "-O3"])
 def flash_attention_fwd(
     batch,
     seq_len,
@@ -369,7 +466,6 @@ def flash_attention_fwd(
     num_q_blocks = q_seq // TILE_Q_L2
     num_kv_blocks = kv_seq // TILE_KV_L2
     global_q_tasks = num_bh * num_q_blocks
-    total_tasks = global_q_tasks * num_kv_blocks
 
     num_q_stages = 1 + (NUM_STAGES + num_kv_blocks - 1) // num_kv_blocks
 
@@ -395,12 +491,12 @@ def flash_attention_fwd(
             O_bh = T.decl_buffer([num_bh, q_seq, dim], dtype, data=Output.data, scope="global")
 
             # --- L1 buffers (Cube data path) ---
-            a_l1  = T.alloc_L1([2, TILE_M, TILE_K], dtype)
+            a_l1 = T.alloc_L1([2, TILE_M, TILE_K], dtype)
             kv_l1 = T.alloc_L1([N_ITERS, TILE_K, DIM], dtype)
 
             T.annotate_layout(
                 {
-                    a_l1:  make_zn_layout(a_l1),
+                    a_l1: make_zn_layout(a_l1),
                     kv_l1: make_nz_layout(kv_l1),
                 }
             )
@@ -421,40 +517,45 @@ def flash_attention_fwd(
             # [144K,~160K) auto  — stats + composed softmax temporaries
 
             # --- Work [0K, 32K) — V-pipe only, no Lock ---
-            score_local = T.alloc_ub([TILE_Q_UB, TILE_KV_L2], accum_dtype)   # 32KB
+            score_local = T.alloc_ub([TILE_Q_UB, TILE_KV_L2], accum_dtype)  # 32KB
 
             # --- Store [32K, 80K) — ST_ON + ST_BUF Lock ---
-            st_o_norm   = T.alloc_ub([TILE_Q_ACC, DIM], dtype)               # 16KB
-            st_prob     = T.alloc_ub([TILE_Q_UB, TILE_KV_L2], dtype)         # 16KB
-            st_o_acc    = T.alloc_ub([TILE_Q_ACC, DIM], accum_dtype)          # 32KB (alias st_prob)
+            st_o_norm = T.alloc_ub([TILE_Q_ACC, DIM], dtype)  # 16KB
+            st_prob = T.alloc_ub([TILE_Q_UB, TILE_KV_L2], dtype)  # 16KB
+            st_o_acc = T.alloc_ub([TILE_Q_ACC, DIM], accum_dtype)  # 32KB (alias st_prob)
 
             # --- Load [80K, 144K) — LD_BUF Lock ---
-            ld_score    = T.alloc_ub([TILE_Q_UB, TILE_KV_L2], dtype)         # 16KB
-            ld_o_acc    = T.alloc_ub([TILE_Q_ACC, DIM], accum_dtype)          # 32KB (alias ld_score)
-            ld_o_partial = T.alloc_ub([TILE_Q_ACC, DIM], accum_dtype)         # 32KB
+            ld_score = T.alloc_ub([TILE_Q_UB, TILE_KV_L2], dtype)  # 16KB
+            ld_o_acc = T.alloc_ub([TILE_Q_ACC, DIM], accum_dtype)  # 32KB (alias ld_score)
+            ld_o_partial = T.alloc_ub([TILE_Q_ACC, DIM], accum_dtype)  # 32KB
 
             row_expand_scalars = T.alloc_ub([TILE_Q_ACC, ELEM_PER_BLK], accum_dtype)
-            T.annotate_address({
-                # work [0K, 32K)
-                score_local: 0, row_expand_scalars: 0,
-                # store [32K, 80K)
-                st_o_norm: 32768,
-                st_prob: 49152, st_o_acc: 49152,
-                # load [80K, 144K)
-                ld_score: 81920, ld_o_acc: 81920,
-                ld_o_partial: 114688,
-            })
+            T.annotate_address(
+                {
+                    # work [0K, 32K)
+                    score_local: 0,
+                    row_expand_scalars: 0,
+                    # store [32K, 80K)
+                    st_o_norm: 32768,
+                    st_prob: 49152,
+                    st_o_acc: 49152,
+                    # load [80K, 144K)
+                    ld_score: 81920,
+                    ld_o_acc: 81920,
+                    ld_o_partial: 114688,
+                }
+            )
 
             # --- Auto [144K, ~158K) — stats + composed softmax workspace ---
             # Compact statistics are expanded only for row-wise consumers.
-            m_stats      = T.alloc_ub([HALF_Q, 1], accum_dtype)
-            m_prev       = T.alloc_ub([HALF_Q, 1], accum_dtype)
-            l_panel      = T.alloc_ub([HALF_Q, 1], accum_dtype)
-            sfm_brcb     = T.alloc_ub([TILE_Q_UB, ELEM_PER_BLK], accum_dtype)
-            sum_brcb     = T.alloc_ub([HALF_Q, ELEM_PER_BLK], accum_dtype)
+            m_stats = T.alloc_ub([HALF_Q, 1], accum_dtype)
+            m_prev = T.alloc_ub([HALF_Q, 1], accum_dtype)
+            l_panel = T.alloc_ub([HALF_Q, 1], accum_dtype)
+            sfm_brcb = T.alloc_ub([TILE_Q_UB, ELEM_PER_BLK], accum_dtype)
+            sum_brcb = T.alloc_ub([HALF_Q, ELEM_PER_BLK], accum_dtype)
             l_stats_ring = T.alloc_ub([num_q_stages, HALF_Q, ELEM_PER_BLK], accum_dtype)
-            scale_ring   = T.alloc_ub([NUM_STAGES, HALF_Q, ELEM_PER_BLK], accum_dtype)
-            sfm_tmp      = T.alloc_ub([SFM_WORKSPACE_BYTES], "uint8")
+            scale_ring = T.alloc_ub([NUM_STAGES, HALF_Q, ELEM_PER_BLK], accum_dtype)
+            sfm_tmp = T.alloc_ub([SFM_WORKSPACE_BYTES], "uint8")
 
             my_start = cid * q_tasks_per_core + T.if_then_else(cid < r_tasks, cid, r_tasks)
             my_count = q_tasks_per_core + T.if_then_else(cid < r_tasks, 1, 0)
@@ -464,7 +565,13 @@ def flash_attention_fwd(
             # Cube scope
             # ===============================================================
             with T.Scope("C"):
-                INIT_LOCKS A_L1, KV_L1, L0AB, L0C
+                T.set_flag("MTE1", "MTE2", 0)
+                T.set_flag("MTE1", "MTE2", 1)
+                T.set_flag("MTE1", "MTE2", 2)
+                T.set_flag("M", "MTE1", 3)
+                T.set_flag("M", "MTE1", 4)
+                T.set_flag("FIX", "M", 5)
+                T.set_flag("FIX", "M", 6)
 
                 for step in T.serial(my_total_steps + NUM_STAGES):
                     T.wait_cross_flag(SEM_CUBE)
@@ -475,10 +582,20 @@ def flash_attention_fwd(
                         bh_a = (my_start + old_step // num_kv_blocks) // num_q_blocks
                         kv_off_a = (old_step % num_kv_blocks) * TILE_KV_L2
                         gemm_contraction_split(
-                            ws_sp, cid, stage,
-                            V_bh, bh_a, kv_off_a,
-                            ws_op, cid, stage,
-                            a_l1, kv_l1, l0a, l0b, l0c,
+                            ws_sp,
+                            cid,
+                            stage,
+                            V_bh,
+                            bh_a,
+                            kv_off_a,
+                            ws_op,
+                            cid,
+                            stage,
+                            a_l1,
+                            kv_l1,
+                            l0a,
+                            l0b,
+                            l0c,
                         )
 
                     if step < my_total_steps:
@@ -487,15 +604,31 @@ def flash_attention_fwd(
                         q_off = (global_q % num_q_blocks) * TILE_Q_L2
                         kv_off_b = (step % num_kv_blocks) * TILE_KV_L2
                         gemm_output_split(
-                            Q_bh, bh_b, q_off,
-                            K_bh, bh_b, kv_off_b,
-                            ws_sp, cid, stage,
-                            a_l1, kv_l1, l0a, l0b, l0c,
+                            Q_bh,
+                            bh_b,
+                            q_off,
+                            K_bh,
+                            bh_b,
+                            kv_off_b,
+                            ws_sp,
+                            cid,
+                            stage,
+                            a_l1,
+                            kv_l1,
+                            l0a,
+                            l0b,
+                            l0c,
                         )
 
                     T.set_cross_flag("FIX", SEM_VEC)
 
-                DESTROY_LOCKS A_L1, KV_L1, L0AB, L0C
+                T.wait_flag("MTE1", "MTE2", 0)
+                T.wait_flag("MTE1", "MTE2", 1)
+                T.wait_flag("MTE1", "MTE2", 2)
+                T.wait_flag("M", "MTE1", 3)
+                T.wait_flag("M", "MTE1", 4)
+                T.wait_flag("FIX", "M", 5)
+                T.wait_flag("FIX", "M", 6)
 
             # ===============================================================
             # Vector scope
@@ -503,23 +636,86 @@ def flash_attention_fwd(
             with T.Scope("V"):
                 for _ in range(NUM_STAGES):
                     T.set_cross_flag("MTE2", SEM_CUBE)
-                INIT_LOCKS LD_BUF, ST_BUF, ST_ON, OA_WB
+                T.set_flag("V", "MTE2", 0)
+                T.set_flag("MTE3", "V", 1)
+                T.set_flag("MTE3", "V", 2)
+                T.set_flag("MTE3", "MTE2", 3)
 
                 for step in T.serial(my_total_steps + NUM_STAGES):
                     T.wait_cross_flag(SEM_VEC)
 
                     if step >= NUM_STAGES:
-                        ACQ MTE2 OA_WB
-                        vec_o_acc(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages)
-                        REL MTE3 OA_WB
+                        T.wait_flag("MTE3", "MTE2", 3)
+                        vec_o_acc(
+                            step,
+                            my_start,
+                            num_q_blocks,
+                            num_kv_blocks,
+                            num_q_stages,
+                            cid,
+                            vid,
+                            ws_op,
+                            ws_oa,
+                            O_bh,
+                            ld_o_partial,
+                            ld_o_acc,
+                            st_o_acc,
+                            st_o_norm,
+                            row_expand_scalars,
+                            scale_ring,
+                            l_stats_ring,
+                        )
+                        T.set_flag("MTE3", "MTE2", 3)
 
                     if step < my_total_steps:
-                        vec_softmax(step, my_start, num_q_blocks, num_kv_blocks, num_q_stages, sm_scale)
+                        vec_softmax(
+                            step,
+                            my_start,
+                            num_kv_blocks,
+                            num_q_stages,
+                            sm_scale,
+                            cid,
+                            vid,
+                            ws_sp,
+                            ld_score,
+                            score_local,
+                            st_prob,
+                            m_stats,
+                            m_prev,
+                            l_panel,
+                            sfm_brcb,
+                            sum_brcb,
+                            l_stats_ring,
+                            scale_ring,
+                            sfm_tmp,
+                        )
 
-                DESTROY_LOCKS LD_BUF, ST_BUF, ST_ON, OA_WB
+                T.wait_flag("V", "MTE2", 0)
+                T.wait_flag("MTE3", "V", 1)
+                T.wait_flag("MTE3", "V", 2)
+                T.wait_flag("MTE3", "MTE2", 3)
 
     return main
 
 
+def ref_flash_attn(q, k, v):
+    """Compute the non-causal GQA reference with PyTorch SDPA."""
+    if k.shape[1] != q.shape[1]:
+        repeats = q.shape[1] // k.shape[1]
+        k = k.repeat_interleave(repeats, dim=1)
+        v = v.repeat_interleave(repeats, dim=1)
+
+    return torch.nn.functional.scaled_dot_product_attention(
+        q.float(),
+        k.float(),
+        v.float(),
+        attn_mask=None,
+        dropout_p=0.0,
+        is_causal=False,
+    ).to(torch.float16)
+
+
+
+
 def make_args(case, canonical):
-    return (canonical["q"], canonical["k"], canonical["v"])
+    return canonical["q"], canonical["k"], canonical["v"]

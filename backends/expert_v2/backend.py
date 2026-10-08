@@ -1,9 +1,9 @@
-"""tl_stream_v3 -- composed online softmax using reduction primitives, fully manual sync."""
+"""Expert v2 -- TileLang-first composed online softmax with three workspace slots."""
 
 from core.contract import Meta
 
 META = Meta(
-    name="tl_stream_v3",
+    name="expert_v2",
     type="tilelang",
     op_type="main_kernel",
     is_reference=False,
@@ -14,7 +14,7 @@ META = Meta(
 
 
 def kernel(case, *, kernel_name: str):
-    from backends.tl_stream_v3 import impl
+    from backends.expert_v2 import impl
 
     return impl.flash_attention_fwd(
         kernel_name=kernel_name,
@@ -27,6 +27,6 @@ def kernel(case, *, kernel_name: str):
 
 
 def assemble(case, canonical):
-    from backends.tl_stream_v3 import impl
+    from backends.expert_v2 import impl
 
     return impl.make_args(case, canonical)
