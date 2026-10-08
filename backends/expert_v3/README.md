@@ -29,7 +29,7 @@ python -m core.bench --backends expert_v3 --cases all --devices 0
 - 每组处理 256 个 query，每次访问 512 个 key，使用 24 组静态任务；不受 `FA_LOGICAL_BLOCKS` 影响。
 - FP32 输出累加常驻片上向量存储区（UB），输入和输出各有两个 16 KiB 搬运槽。
 - 使用 `T.reduce_max/sum`，不需要额外的融合softmax接口或框架补丁。
-- 矩阵乘法与结果导出通过 UnitFlag 衔接；验证过的设备二进制没有整条 Vector 流水的 `BAR.V` 屏障。
+- 矩阵乘法与结果导出通过 UnitFlag 衔接；Vector 按具体数据依赖安排等待。
 
 正确性范围是仓库三个标准输入和验证过的有限值输入；Cube 通信仍是 FP16，
 FP32 中间计算不代表支持任意数值范围。
