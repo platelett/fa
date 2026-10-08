@@ -56,7 +56,7 @@ template<bool T,bool NZ> struct Strip {
     else vcopy(reinterpret_cast<__ubuf__ uint32_t *>(m),At<uint32_t>(TEMP),1,1,1,8,8);
     RawGap();
   }
-  __aicore__ void Coefficients() {
+  template<bool Wait=true> __aicore__ void Coefficients() {
     auto *m=reinterpret_cast<__ubuf__ uint32_t *>(At<float>(M_BASE)+owned);
     FloatMask();
     if constexpr(!NZ) {
@@ -65,14 +65,14 @@ template<bool T,bool NZ> struct Strip {
       vbrcb(At<uint32_t>(REDUCE_A+256),m,16,128,2);
     } else if constexpr(!T) {
       // Eight-key halves use opposite-parity coefficient blocks.
-      vbrcb(At<uint32_t>(REDUCE_A),m,2,16,2);
-      vbrcb(At<uint32_t>(REDUCE_A+32),m,2,16,2);
+      vbrcb(At<uint32_t>(REDUCE_B),m,2,16,2);
+      vbrcb(At<uint32_t>(REDUCE_B+32),m,2,16,2);
     } else {
       set_vector_mask(0,0xffULL);
       vcopy(At<uint32_t>(COEF_BASE)+8,m,1,1,1,8,8);
       vcopy(At<uint32_t>(COEF_BASE),m+8,1,1,1,8,8);
     }
-    RawGap();
+    if constexpr(Wait) RawGap();
   }
   __aicore__ void ScaleScores() {
     auto *f=At<float>(WORK);
@@ -85,31 +85,31 @@ template<bool T,bool NZ> struct Strip {
   }
   __aicore__ void AffineExp() {
     auto *f=At<float>(WORK); FloatMask();
-    if constexpr(!NZ) {
+    if constexpr(G) {
+      // Max is finished. Bias uses B; A is a transient for one physical half.
+      auto *tmp=At<float>(REDUCE_A),*bias=At<float>(REDUCE_B);
+      _Pragma("unroll") for(uint32_t part=0;part<2;++part) {
+        _Pragma("unroll") for(uint32_t q=0;q<16;q+=8)
+          _Pragma("unroll") for(uint32_t k=0;k<16;k+=8)
+            vsub(tmp+q*16+k,f+part*4160+q*16+k,
+                 bias+q*16+(k?0:8),16,2,2,2,32,32,0);
+        vexp(f+part*4160,tmp,64,1,1,8,8);
+      }
+    } else if constexpr(!NZ) {
       _Pragma("unroll") for(uint32_t c=0;c<512;c+=64)
         vsub(f+c,f+c,At<float>(REDUCE_A)+((c&64)?0:64),16,1,1,0,64,64,16);
     } else if constexpr(T) {
       _Pragma("unroll") for(uint32_t part=0;part<2;++part)
         _Pragma("unroll") for(uint32_t q=0;q<16;q+=8)
           vsub(f+part*4160+q,f+part*4160+q,At<float>(COEF_BASE)+(q?0:8),32,2,2,0,16,16,0);
-    } else {
-      _Pragma("unroll") for(uint32_t part=0;part<2;++part)
-        _Pragma("unroll") for(uint32_t q=0;q<16;q+=8)
-          _Pragma("unroll") for(uint32_t k=0;k<16;k+=8)
-            vsub(f+part*4160+q*16+k,f+part*4160+q*16+k,
-                 At<float>(REDUCE_A)+q*16+(k?0:8),16,2,2,2,32,32,0);
     }
     FloatMask();
-    if constexpr(NZ) { vexp(f,f,64,1,1,8,8); vexp(f+4160,f+4160,64,1,1,8,8); }
+    if constexpr(G) return;
+    else if constexpr(NZ) { vexp(f,f,64,1,1,8,8); vexp(f+4160,f+4160,64,1,1,8,8); }
     else vexp(f,f,128,1,1,8,8);
    
   }
-  __aicore__ void Pack() {
-    auto out=outputs.Next(); out.AcquireProducer(); FloatMask();
-    if constexpr(NZ) {
-      vconv_f322f16(out.addr,At<float>(WORK),64,1,1,4,8);
-      vconv_f322f16(out.addr+4096,At<float>(WORK)+4160,64,1,1,4,8);
-    } else vconv_f322f16(out.addr,At<float>(WORK),128,1,1,4,8);
+  __aicore__ void Publish(const OutputQueue::Handle &out) {
     out.ReleaseProducer();
     with_locks(PIPE_MTE3,out.token) {
       if constexpr(G) {
@@ -117,6 +117,23 @@ template<bool T,bool NZ> struct Strip {
         copy_ubuf_to_gm(gm+32768,out.addr+4096,0,16,16,0,112);
       } else D::Store1D(gm,out.addr,16384);
     }
+  }
+  template<uint32_t Begin>
+  __aicore__ void PackChunk(const OutputQueue::Handle &out) {
+    static_assert(Begin%2048==0 && Begin+2048<=8192);
+    static_assert(Begin>=4096 || Begin+2048<=4096, "do not cross the WORK gap");
+    if constexpr(Begin==0) out.AcquireProducer();
+    FloatMask();
+    constexpr uint32_t source=Begin+(Begin>=4096?64:0);
+    vconv_f322f16(out.addr+Begin,At<float>(WORK)+source,32,1,1,4,8);
+  }
+  __aicore__ void Pack(const OutputQueue::Handle &out) {
+    out.AcquireProducer(); FloatMask();
+    if constexpr(NZ) {
+      vconv_f322f16(out.addr,At<float>(WORK),64,1,1,4,8);
+      vconv_f322f16(out.addr+4096,At<float>(WORK)+4160,64,1,1,4,8);
+    } else vconv_f322f16(out.addr,At<float>(WORK),128,1,1,4,8);
+    Publish(out);
   }
   template<uint32_t Out,bool KeepGap>
   __aicore__ void HalfPair(__ubuf__ float *dst,__ubuf__ float *src) {
@@ -130,14 +147,22 @@ template<bool T,bool NZ> struct Strip {
     }
   }
   static constexpr uint32_t SUM_LEVELS=T?9:6;
-  template<uint32_t L> __aicore__ void SumStages() {
+  template<uint32_t L> __aicore__ void SumStages(const OutputQueue::Handle &packed) {
     auto *src=At<float>(L==0?WORK:((L&1)?REDUCE_A:REDUCE_B));
     auto *dst=At<float>((L&1)?REDUCE_B:REDUCE_A);
     constexpr uint32_t out=4096>>L;
     if constexpr(T) HalfPair<out,(out>=256)>(dst,src);
     else if constexpr(G && L<5) HalfPair<out,(L<4)>(dst,src);
     else { FloatMask(); vadd(dst,src,src+8,out/64,1,2,2,8,16,16); }
-    if constexpr(L+2==SUM_LEVELS) { Pack(); }
+    if constexpr(G && L>=2) {
+      // Preserve alpha Exp at level 2; each following conversion supplies
+      // useful work before the next dependent sum stage or group finish.
+      if constexpr(L==2) {
+        if(kv) { Rows(); vexp(alpha,alpha,1,1,1,8,8); }
+      }
+      PackChunk<(L-2)*2048>(packed);
+      if constexpr(L+1==SUM_LEVELS) Publish(packed);
+    } else if constexpr(L+2==SUM_LEVELS) { Pack(packed); }
     else if constexpr(L==1) {
       Rows();
       if(kv) vsub(alpha,alpha,At<float>(M_BASE)+owned,1,1,1,1,8,8,8);
@@ -147,17 +172,55 @@ template<bool T,bool NZ> struct Strip {
       if(kv) { Rows(); vexp(alpha,alpha,1,1,1,8,8); }
       RawGap<SUM_SPACING[T][L]>();
     } else RawGap<SUM_SPACING[T][L]>();
-    if constexpr(L+1<SUM_LEVELS) SumStages<L+1>();
+    if constexpr(L+1<SUM_LEVELS) SumStages<L+1>(packed);
     else {
       auto *z=At<float>(SUM_BASE)+owned;
       if constexpr(T) { Rows(); vcopy(reinterpret_cast<__ubuf__ uint32_t *>(z),reinterpret_cast<__ubuf__ uint32_t *>(dst),1,1,1,8,8); }
       else { FloatMask(); vcgadd(z,dst,2,1,1,8); }
     }
   }
+  template<uint32_t Part> __aicore__ void WidenPart() {
+    static_assert(Part<2);
+    FloatMask();
+    vconv_f162f32(At<float>(WORK)+Part*4160,input.addr+Part*4224,64,1,1,8,4);
+  }
+  template<uint32_t Begin,uint32_t Count> __aicore__ void ScaleRange() {
+    static_assert(Begin+Count<=8192 && Count%64==0);
+    static_assert(Begin>=4096 || Begin+Count<=4096, "do not cross the WORK gap");
+    auto *f=At<float>(WORK)+Begin+(Begin>=4096?64:0);
+    FloatMask(); vmuls(f,f,float(SCALE),Count/64,1,1,8,8);
+  }
+  __aicore__ void NormalMaxAndScale() {
+    // Same complete strip and arithmetic; useful work separates dependent stages.
+    max_tree.template Stage<false,0>(input.addr);
+    max_tree.template Stage<false,1>(input.addr); WidenPart<0>();
+    max_tree.template Stage<false,2>(input.addr); WidenPart<1>();
+    input.ReleaseConsumer(); // All original-score readers have now finished.
+    max_tree.template Stage<false,3>(input.addr); ScaleRange<0,1024>();
+    max_tree.template Stage<false,4>(input.addr); ScaleRange<1024,1024>();
+    max_tree.template Finish<false>(); ScaleRange<2048,1024>();
+    Rows(); vconv_f162f32(At<float>(TEMP),max_tree.Result(),1,1,1,8,4);
+    ScaleRange<3072,1024>();
+    Rows(); vmuls(At<float>(TEMP),At<float>(TEMP),float(SCALE),1,1,1,8,8);
+    ScaleRange<4096,1024>();
+    auto *m=At<float>(M_BASE)+owned;
+    Rows();
+    if(kv) vmax(m,m,At<float>(TEMP),1,1,1,1,8,8,8);
+    else vcopy(reinterpret_cast<__ubuf__ uint32_t *>(m),At<uint32_t>(TEMP),1,1,1,8,8);
+    ScaleRange<5120,1024>();
+    Coefficients<false>(); ScaleRange<6144,2048>();
+  }
   __aicore__ void Compute() {
-    input.AcquireConsumer(); MaxStages<0>();
-    max_tree.template Finish<false>(); RawGap();
-    UpdateMax(); Coefficients(); AffineExp(); SumStages<0>();
+    input.AcquireConsumer();
+    if constexpr(G) NormalMaxAndScale();
+    else {
+      MaxStages<0>(); max_tree.template Finish<false>(); RawGap();
+      UpdateMax(); Coefficients();
+    }
+    AffineExp();
+    // Select one physical output slot; acquire it only at the first chunk.
+    auto packed=outputs.Next();
+    SumStages<0>(packed);
   }
 };
 }

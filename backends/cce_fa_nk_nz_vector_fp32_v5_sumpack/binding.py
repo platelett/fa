@@ -5,6 +5,7 @@ from dataclasses import replace
 
 class Operator:
     def __init__(self, library, config):
+        self.identity = {'backend': 'cce_fa_nk_nz_vector_fp32_v5_sumpack', 'op_type': 'FaFaNkNzVectorFp32V5Sumpack', 'q_l1': 256, 'q_block': 256, 'ws_k': 512}
         self.config = config
         self.scratch = None
         self.buffers = {}
@@ -17,18 +18,18 @@ class Operator:
         self.acl.aclCreateTensor.restype = p
         self.acl.aclDestroyTensor.argtypes = [p]
         self.acl.aclDestroyTensor.restype = C.c_int
-        self.prepare = self.library.aclnnFaFaNkNzVectorFp32V3GetWorkspaceSize
+        self.prepare = self.library.aclnnFaFaNkNzVectorFp32V5SumpackGetWorkspaceSize
         self.prepare.argtypes = [p,p,p,C.c_int64,C.c_int64,C.c_int64,C.c_int64,C.c_bool,C.c_int64,
                                  p,p,p,p,p,p,C.POINTER(C.c_uint64),C.POINTER(p)]
         self.prepare.restype = C.c_int
-        self.launch = self.library.aclnnFaFaNkNzVectorFp32V3
+        self.launch = self.library.aclnnFaFaNkNzVectorFp32V5Sumpack
         self.launch.argtypes = [p,C.c_uint64,p,p]
         self.launch.restype = C.c_int
 
     @staticmethod
     def check(status, where):
         if status:
-            raise RuntimeError(f'FaFaNkNzVectorFp32V3 {where}: {status}')
+            raise RuntimeError(f'FaFaNkNzVectorFp32V5Sumpack {where}: {status}')
 
     def allocate(self, q, k, c):
         import torch

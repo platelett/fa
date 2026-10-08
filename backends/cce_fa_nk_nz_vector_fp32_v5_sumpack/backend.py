@@ -10,11 +10,11 @@ from .project import build
 from .parameters import MODE, WS_Q, TRANSPOSE, SP_NZ
 
 META = Meta(
-    name="cce_fa_nk_nz_vector_fp32_v3",
+    name="cce_fa_nk_nz_vector_fp32_v5_sumpack",
     type="ascendc",
-    op_type="FaFaNkNzVectorFp32V3",
+    op_type="FaFaNkNzVectorFp32V5Sumpack",
     diagnostic=False,
-    notes="Q_L1=256, WS_Q=256, WS_K=512; FP32 O resident across KV; independent complete O and softmax phases; selected public implementation",
+    notes="Q_L1=256, WS_Q=256, WS_K=512; FP32 O resident across KV; independent complete O and softmax phases; selected public FP32 implementation",
 )
 
 
@@ -61,8 +61,8 @@ def project(case):
         tuple(
             str(rel / p)
             for p in (
-                "libfa_fa_nk_nz_vector_fp32_v3.so",
-                "op_host/libfa_fa_nk_nz_vector_fp32_v3_ascendc_cust_optiling.so",
+                "libfa_fa_nk_nz_vector_fp32_v5_sumpack.so",
+                "op_host/libfa_fa_nk_nz_vector_fp32_v5_sumpack_ascendc_cust_optiling.so",
                 "op_kernel/ascendc_kernels/binary/config/ascend910_93/binary_info_config.json",
                 "build.json",
             )
@@ -79,3 +79,7 @@ def load(case, project):
 
 def adapt(case, canonical):
     return tuple(canonical[k] for k in ("q", "k", "v"))
+
+SOURCE_IDENTITY = {'backend': 'cce_fa_nk_nz_vector_fp32_v5_sumpack', 'op_type': 'FaFaNkNzVectorFp32V5Sumpack', 'q_l1': 256, 'q_block': 256, 'ws_k': 512}
+if Path(__file__).resolve().parent.name != SOURCE_IDENTITY['backend']:
+    raise RuntimeError('generated backend directory identity mismatch')

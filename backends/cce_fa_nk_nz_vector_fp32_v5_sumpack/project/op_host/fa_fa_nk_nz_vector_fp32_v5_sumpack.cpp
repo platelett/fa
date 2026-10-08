@@ -1,6 +1,6 @@
 #include "../op_kernel/variant_config.h"
-#include "../op_kernel/fa_fa_nk_nz_vector_fp32_v3_tiling.h"
-#include "../op_kernel/tiling_key_fa_fa_nk_nz_vector_fp32_v3.h"
+#include "../op_kernel/fa_fa_nk_nz_vector_fp32_v5_sumpack_tiling.h"
+#include "../op_kernel/tiling_key_fa_fa_nk_nz_vector_fp32_v5_sumpack.h"
 #include "register/op_def_registry.h"
 #include "tiling/platform/platform_ascendc.h"
 
@@ -66,7 +66,7 @@ ge::graphStatus Tile(gert::TilingContext *c) {
       q.GetDim(2) > UINT32_MAX || k.GetDim(2) > UINT32_MAX ||
       uint64_t(q.GetDim(0)) * q.GetDim(1) * ((q.GetDim(2) + *ql - 1) / *ql) > UINT32_MAX)
     return ge::GRAPH_FAILED;
-  auto *d = c->GetTilingData<FaFaNkNzVectorFp32V3TilingData>();
+  auto *d = c->GetTilingData<FaFaNkNzVectorFp32V5SumpackTilingData>();
   if (!d)
     return ge::GRAPH_FAILED;
   *d = {uint32_t(q.GetDim(0)), uint32_t(q.GetDim(1)), uint32_t(k.GetDim(1)),
@@ -87,9 +87,9 @@ ge::graphStatus Tile(gert::TilingContext *c) {
 }
 } // namespace
 namespace ops {
-class FaFaNkNzVectorFp32V3 : public OpDef {
+class FaFaNkNzVectorFp32V5Sumpack : public OpDef {
 public:
-  explicit FaFaNkNzVectorFp32V3(const char *name) : OpDef(name) {
+  explicit FaFaNkNzVectorFp32V5Sumpack(const char *name) : OpDef(name) {
     this->Input("q")
         .ParamType(REQUIRED)
         .DataType({ge::DT_FLOAT16})
@@ -130,5 +130,5 @@ public:
         .AddConfig("ascend910_93");
   }
 };
-OP_ADD(FaFaNkNzVectorFp32V3);
+OP_ADD(FaFaNkNzVectorFp32V5Sumpack);
 } // namespace ops

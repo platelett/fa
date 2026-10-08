@@ -1,4 +1,4 @@
-set(host_src ${CMAKE_CURRENT_SOURCE_DIR}/fa_fa_nk_nz_vector_fp32_v3.cpp)
+set(host_src ${CMAKE_CURRENT_SOURCE_DIR}/fa_fa_nk_nz_vector_fp32_v5_sumpack.cpp)
 npu_op_code_gen(SRC ${host_src} PACKAGE ${package_name} OUT_DIR ${ASCEND_AUTOGEN_PATH})
 npu_op_library(cust_optiling TILING ${host_src})
 file(GLOB aclnn_src ${ASCEND_AUTOGEN_PATH}/aclnn_*.cpp)

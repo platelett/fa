@@ -6,15 +6,15 @@
 
 ## 性能怎么看
 
-表中每一行是一组输入。`Batch` 表示一次处理几个样本，`Length` 表示每个样本的序列长度。四个版本处理的输入相同，结果都通过了正确性检查。
+表中每一行是一组输入。`Batch` 表示一次处理几个样本，`Length` 表示每个样本的序列长度。四个版本处理的输入相同，结果都通过了正确性检查。本次只替换 CCE FP32，并更新这一列的实测值。
 
 **用时越小越快，单位为毫秒。**
 
 | Batch | Length | Torch | TileLang | CCE FP16 | CCE FP32 |
 |---:|---:|---:|---:|---:|---:|
-| 2 | 131072 | 1207.513 | 1118.169 | 572.472 | 793.552 |
-| 2 | 65536 | 300.555 | 276.640 | 143.603 | 199.889 |
-| 1 | 32768 | 37.564 | 34.508 | 18.440 | 25.524 |
+| 2 | 131072 | 1207.513 | 1118.169 | 572.472 | 714.630 |
+| 2 | 65536 | 300.555 | 276.640 | 143.603 | 180.099 |
+| 1 | 32768 | 37.564 | 34.508 | 18.440 | 23.018 |
 
 **下面的百分比，用来比较实际速度与这台机器的理论矩阵乘法速度。越高，越接近理论上限。**
 
@@ -24,11 +24,11 @@ Cube 是昇腾中负责矩阵乘法的计算单元。我们用 attention 中两�
 
 | Batch | Length | Torch | TileLang | CCE FP16 | CCE FP32 |
 |---:|---:|---:|---:|---:|---:|
-| 2 | 131072 | 46.1% | 49.8% | 97.3% | 70.2% |
-| 2 | 65536 | 46.3% | 50.4% | 97.0% | 69.7% |
-| 1 | 32768 | 46.4% | 50.5% | 94.4% | 68.2% |
+| 2 | 131072 | 46.1% | 49.8% | 97.3% | 78.0% |
+| 2 | 65536 | 46.3% | 50.4% | 97.0% | 77.3% |
+| 1 | 32768 | 46.4% | 50.5% | 94.4% | 75.6% |
 
-两张表都来自同一台 Atlas A3：预热后各测 10 次，取中位数。四个版本的百分比使用同一个参照——这台机器 25 个 Cube 的 FP16 理论峰值，共 378.88 TFLOPS。
+两张表都来自同一台 Atlas A3，预热后测 10 次、取中位数。CCE FP32 在 2026-10-08（UTC）替换为第五版并复测，其他三列保留此前结果；各列不是同一轮测量。四个版本的百分比使用同一个参照——这台机器 25 个 Cube 的 FP16 理论峰值，共 378.88 TFLOPS。
 
 ## 怎么运行
 
@@ -58,7 +58,7 @@ FA_LOGICAL_BLOCKS=0 python -m core.bench --cases all --devices 0
 <details>
 <summary>测试参数与峰值比例公式</summary>
 
-测试环境：Atlas A3 `Ascend910_9392`、CANN 9.1、TileLang PR #1852 提交 `77a444b2`。每轮预热 3 次，按正反顺序各测 5 次，保留全部 10 个样本。输入为非因果 attention，12 个 query heads、1 个 KV head，head dimension 为 128。
+测试环境：Atlas A3 `Ascend910_9392`、CANN 9.1、TileLang PR #1852 提交 `77a444b2`。均预热 3 次。此前四版测试按正反顺序各测 5 次；本次只复测 CCE FP32，连续记录 10 次设备内核用时，原始样本保存在本地。输入为非因果 attention，12 个 query heads、1 个 KV head，head dimension 为 128。
 
 仅统计 QK 和 PV 两次矩阵乘法的 FLOPs：
 
@@ -85,7 +85,7 @@ installation scripts are included.
 | `npu_fa` | `torch_npu.npu_fusion_attention`, native GQA; correctness reference |
 | `tl_stream_v3` | TL v3 with three workspace slots (ns3) and composed reduce-max/subtract/exp/reduce-sum softmax |
 | `cce_fa_nqkq_nz_resident_v13_q768_pool_i4_p128` | CCE Normal-NZ Q-K-Q, Q_L1=768, WS_Q=256, WS_K=512; resident FP16 O |
-| `cce_fa_nk_nz_vector_fp32_v3` | CCE Normal-NZ K-first, Q_L1=WS_Q=256, WS_K=512; resident FP32 O; no BAR.V in the Vector payload |
+| `cce_fa_nk_nz_vector_fp32_v5_sumpack` | CCE Normal-NZ K-first, Q_L1=WS_Q=256, WS_K=512; resident FP32 O; reused reduction scratch and staged P conversion; no BAR.V in the Vector payload |
 
 All four return normalized attention output in FP16 with shape `[B,Hq,Nq,128]`.
 The CCE FP32 variant uses FP32 Vector arithmetic except FP16 max comparisons;
@@ -133,7 +133,7 @@ To run only the Torch reference and a CCE implementation:
 
 ```bash
 python -m core.bench \
-  --backends npu_fa,cce_fa_nk_nz_vector_fp32_v3 \
+  --backends npu_fa,cce_fa_nk_nz_vector_fp32_v5_sumpack \
   --cases all --devices 0
 ```
 
@@ -158,7 +158,7 @@ installations:
 
 ```bash
 FA_LOGICAL_BLOCKS=0 python -m core.bench \
-  --backends cce_fa_nqkq_nz_resident_v13_q768_pool_i4_p128,cce_fa_nk_nz_vector_fp32_v3 \
+  --backends cce_fa_nqkq_nz_resident_v13_q768_pool_i4_p128,cce_fa_nk_nz_vector_fp32_v5_sumpack \
   --cases all --devices 0
 ```
 

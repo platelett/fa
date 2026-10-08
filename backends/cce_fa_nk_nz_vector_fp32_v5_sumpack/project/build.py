@@ -84,15 +84,15 @@ def build():
             raise RuntimeError(f"standard-project build failed; see {out / f'step{i}.log'}")
     binary = out / "op_kernel/ascendc_kernels/binary"
     required = [
-        out / "libfa_fa_nk_nz_vector_fp32_v3.so",
-        out / "op_host/libfa_fa_nk_nz_vector_fp32_v3_ascendc_cust_optiling.so",
+        out / "libfa_fa_nk_nz_vector_fp32_v5_sumpack.so",
+        out / "op_host/libfa_fa_nk_nz_vector_fp32_v5_sumpack_ascendc_cust_optiling.so",
         binary / "config/ascend910_93/binary_info_config.json",
     ]
     objects = list((binary / "ascend910_93").rglob("*.o"))
     if not objects or any(not p.is_file() or not p.stat().st_size for p in required + objects):
         raise RuntimeError("standard package is missing fresh kernel/config/library artifacts")
-    copied = binary / "dynamic/fa_fa_nk_nz_vector_fp32_v3.cpp"
-    if copied.read_bytes() != (ROOT / "op_kernel/fa_fa_nk_nz_vector_fp32_v3.cpp").read_bytes():
+    copied = binary / "dynamic/fa_fa_nk_nz_vector_fp32_v5_sumpack.cpp"
+    if copied.read_bytes() != (ROOT / "op_kernel/fa_fa_nk_nz_vector_fp32_v5_sumpack.cpp").read_bytes():
         raise RuntimeError("CANN copied a stale kernel source")
     if identity() != before:
         raise RuntimeError("project sources changed during build")
